@@ -1,0 +1,57 @@
+services:
+  - type: web
+    name: dapursajiresto
+    runtime: node
+    plan: free
+    region: singapore
+    buildCommand: npm install && npm run build
+    startCommand: npm run start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NEXTAUTH_URL
+        sync: false
+      - key: NEXTAUTH_SECRET
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      - key: EMAIL_FROM
+        value: onboarding@resend.dev
+      - key: APP_NAME
+        value: DapurSajiResto
+      - key: BASE_DOMAIN
+        value: dapursajiresto.onrender.com
+      - key: APP_PROTOCOL
+        value: https
+      - key: SUBSCRIPTION_PRICE
+        value: "10000"
+      - key: SUBSCRIPTION_CURRENCY
+        value: IDR
+      - key: SUBSCRIPTION_INTERVAL
+        value: monthly
+      - key: TRIAL_DAYS
+        value: "7"
+      - key: PAYMENT_BANK_NAME
+        value: BCA
+      - key: PAYMENT_ACCOUNT_NUMBER
+        value: "5390986868"
+      - key: PAYMENT_ACCOUNT_NAME
+        value: HSRA HIDUP SEJAHTERA CV
+      - key: COMPANY_NAME
+        value: DapurSajiResto
+      - key: SOCKET_SERVER_URL
+        sync: false
+      - key: CRON_SECRET
+        sync: false
+      - key: MIDTRANS_IS_PRODUCTION
+        value: "false"
+      - key: MIDTRANS_SERVER_KEY
+        sync: false
+      - key: MIDTRANS_CLIENT_KEY
+        sync: false
+      - key: MIDTRANS_MERCHANT_ID
+        sync: false
+      - key: MIDTRANS_API_BASE_URL
+        value: https://api.sandbox.midtrans.com
