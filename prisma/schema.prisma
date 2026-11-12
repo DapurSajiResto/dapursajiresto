@@ -1,0 +1,318 @@
+// Prisma Schema - DapurSajiResto Multi-Tenant
+// Database: PostgreSQL
+// docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+
+// ============================================================
+// TENANT (Resto) - 1 tenant = 1 restoran pelanggan SaaS
+// ============================================================
+enum TenantStatus {
+  TRIAL       // masa uji coba (TRIAL_DAYS setelah daftar)
+  ACTIVE      // subscription aktif & dibayar
+  PAST_DUE    // pembayaran jatuh tempo, dalam masa retry
+  SUSPENDED   // di-suspend karena pembayaran gagal
+  CANCELLED   // berhenti berlangganan
+}
+
+model Tenant {
+  id              String       @id @default(cuid())
+  namaResto       String
+  subdomain       String       @unique // restoa.namadomain.com
+  ownerName       String
+  email           String       @unique // email pemilik (untuk notifikasi)
+  phone           String?
+  alamat          String?
+  logoUrl         String?
+  // struk config
+  strukHeader     String?      @default("Terima kasih telah berkunjung")
+  strukFooter     String?
+  strukWidth      Int          @default(58) // 58mm atau 80mm
+  // Pengaturan struk: pajak, service charge, charge tambahan
+  strukSettings   Json?        // { pajakAktif, pajakPersen, serviceChargeAktif, serviceChargePersen, chargesTambahan: [{nama, persen}] }
+  status          TenantStatus @default(TRIAL)
+  trialEndsAt     DateTime?
+  suspendedAt     DateTime?
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  users           User[]
+  menuCategories  MenuCategory[]
+  menuItems       MenuItem[]
+  orders          Order[]
+  transactions    Transaction[]
+  subscription    Subscription?
+  paymentLogs     PaymentLog[]
+  emailLogs       EmailLog[]
+
+  @@index([status])
+}
+
+// ============================================================
+// USER - akun login (owner/kasir/pelayan)
+// ============================================================
+enum UserRole {
+  OWNER
+  KASIR
+  PELAYAN
+}
+
+model User {
+  id           String   @id @default(cuid())
+  tenantId     String
+  email        String   @unique
+  passwordHash String
+  name         String
+  role         UserRole @default(PELAYAN)
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  tenant       Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  orders       Order[]  @relation("OrderCreatedBy")
+
+  @@index([tenantId])
+}
+
+// ============================================================
+// MENU
+// ============================================================
+model MenuCategory {
+  id        String     @id @default(cuid())
+  tenantId  String
+  nama      String
+  urutan    Int        @default(0)
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  tenant    Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  items     MenuItem[]
+
+  @@index([tenantId])
+}
+
+model MenuItem {
+  id          String       @id @default(cuid())
+  tenantId    String
+  categoryId  String
+  nama        String
+  deskripsi   String?
+  harga       Int          // dalam Rupiah (integer, no decimal)
+  gambarUrl   String?
+  isAvailable Boolean      @default(true)
+  stock       Int          @default(0)
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  tenant      Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  category    MenuCategory @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  orderItems  OrderItem[]
+
+  @@index([tenantId])
+  @@index([categoryId])
+}
+
+// ============================================================
+// ORDER / PESANAN
+// ============================================================
+enum OrderStatus {
+  PENDING    // baru masuk, belum diproses dapur
+  COOKING    // sedang dimasak
+  READY      // siap disajikan
+  SERVED     // sudah disajikan ke meja
+  PAID       // sudah dibayar & struk dicetak
+  CANCELLED
+}
+
+enum OrderType {
+  DINE_IN    // makan di tempat
+  TAKEAWAY   // bawa pulang
+  DELIVERY   // antar
+}
+
+model Order {
+  id            String      @id @default(cuid())
+  tenantId      String
+  nomorOrder    String      // human-readable: ORD-001, auto-increment per tenant
+  tableNumber   String?     // nomor meja (dine-in)
+  customerName  String?
+  orderType     OrderType   @default(DINE_IN)
+  status        OrderStatus @default(PENDING)
+  total         Int         @default(0)
+  catatan       String?
+  createdById   String
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  tenant        Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  createdBy     User        @relation("OrderCreatedBy", fields: [createdById], references: [id])
+  items         OrderItem[]
+  transaction   Transaction?
+
+  @@index([tenantId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model OrderItem {
+  id             String   @id @default(cuid())
+  orderId        String
+  menuItemId     String
+  namaSnapshot   String   // snapshot nama saat order (jaga jika menu berubah)
+  hargaSnapshot  Int      // snapshot harga saat order
+  qty            Int
+  subtotal       Int
+  catatan        String?
+  createdAt      DateTime @default(now())
+
+  order          Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  menuItem       MenuItem @relation(fields: [menuItemId], references: [id], onDelete: Restrict)
+
+  @@index([orderId])
+}
+
+// ============================================================
+// TRANSACTION / STRUK
+// ============================================================
+enum PaymentMethod {
+  CASH
+  CARD
+  QRIS
+  EWALLET
+  OTHER
+}
+
+model Transaction {
+  id            String         @id @default(cuid())
+  tenantId      String
+  orderId       String         @unique // 1 order = 1 transaksi struk
+  nomorStruk    String         // STRUK-001, auto-increment per tenant
+  total         Int
+  paymentMethod PaymentMethod  @default(CASH)
+  bayar         Int            @default(0) // uang diterima
+  kembalian     Int            @default(0)
+  createdAt     DateTime       @default(now())
+
+  tenant        Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  order         Order          @relation(fields: [orderId], references: [id])
+
+  @@index([tenantId])
+  @@index([createdAt])
+}
+
+// ============================================================
+// SUBSCRIPTION & PAYMENT (SaaS billing)
+// ============================================================
+enum SubscriptionStatus {
+  ACTIVE       // aktif & dibayar
+  PAST_DUE     // retry pembayaran
+  SUSPENDED    // gagal bayar, akses diblokir
+  CANCELLED    // berhenti
+  TRIALING     // masa trial
+}
+
+enum EWalletType {
+  OVO
+  GOPAY
+  SHOPEEPAY
+  DANA
+  QRIS
+  BANK_TRANSFER
+  OTHER
+}
+
+model Subscription {
+  id                   String             @id @default(cuid())
+  tenantId             String             @unique // 1 tenant = 1 subscription
+  plan                 String             @default("basic")
+  harga                Int                @default(10000) // Rp 10.000
+  status               SubscriptionStatus @default(TRIALING)
+  ewalletType          EWalletType?
+  // Midtrans token untuk recurring charge (saved payment)
+  paymentMethodToken   String?            // Midtrans saved token / subscription id
+  // Periode berlangganan
+  currentPeriodStart   DateTime?
+  currentPeriodEnd     DateTime?
+  // Retry tracking
+  retryCount           Int                @default(0)
+  nextRetryAt          DateTime?
+  // Midtrans subscription id (untuk recurring API)
+  midtransSubscriptionId String?
+  createdAt            DateTime           @default(now())
+  updatedAt            DateTime           @updatedAt
+
+  tenant               Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  paymentLogs          PaymentLog[]
+
+  @@index([status])
+  @@index([currentPeriodEnd])
+}
+
+enum PaymentLogStatus {
+  SUCCESS
+  FAILED
+  PENDING
+  RETRYING
+}
+
+model PaymentLog {
+  id              String           @id @default(cuid())
+  tenantId        String
+  subscriptionId  String
+  amount          Int              @default(10000)
+  status          PaymentLogStatus @default(PENDING)
+  gatewayRef      String?          // Midtrans transaction/order id
+  failureReason   String?
+  ewalletType     EWalletType?
+  createdAt       DateTime         @default(now())
+
+  tenant          Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  subscription    Subscription     @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+// ============================================================
+// EMAIL LOG - audit trail notifikasi email
+// ============================================================
+enum EmailType {
+  PAYMENT_SUCCESS
+  PAYMENT_FAILED
+  SUSPEND_NOTICE
+  TRIAL_ENDING
+  WELCOME
+  SUBSCRIPTION_ACTIVATED
+}
+
+enum EmailStatus {
+  SENT
+  FAILED
+  QUEUED
+}
+
+model EmailLog {
+  id         String       @id @default(cuid())
+  tenantId   String
+  type       EmailType
+  toEmail    String
+  subject    String
+  status     EmailStatus  @default(QUEUED)
+  error      String?
+  sentAt     DateTime?
+  createdAt  DateTime     @default(now())
+
+  tenant     Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([status])
+}
