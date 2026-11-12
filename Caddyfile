@@ -1,0 +1,48 @@
+# Caddyfile untuk DapurSajiResto
+# Caddy akan auto-generate SSL certificate (HTTPS) gratis via Let's Encrypt
+# Ganti {DOMAIN} dengan domain Anda yang sebenarnya
+
+{$DOMAIN} {
+    # Proxy ke Next.js app
+    reverse_proxy app:3000 {
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+    }
+
+    # WebSocket support untuk Socket.IO
+    @websockets {
+        header Connection *Upgrade*
+        header Upgrade websocket
+    }
+    reverse_proxy @websockets socket:3001
+
+    # Gzip compression
+    encode gzip
+
+    # Security headers
+    header {
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+        Referrer-Policy strict-origin-when-cross-origin
+        Permissions-Policy "camera=(), microphone=(), geolocation=()"
+    }
+
+    # Cache static assets
+    @static {
+        path /_next/static/*
+    }
+    header @static Cache-Control "public, max-age=31536000, immutable"
+
+    log {
+        output file /data/access.log
+        format json
+    }
+}
+
+# Untuk subdomain multi-tenant (misal: restoa.namadomain.com)
+*.{$BASE_DOMAIN} {
+    reverse_proxy app:3000
+    reverse_proxy @websockets socket:3001
+    encode gzip
+}

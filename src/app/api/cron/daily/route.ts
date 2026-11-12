@@ -2,25 +2,17 @@
 // Endpoint: GET /api/cron/daily?secret=CRON_SECRET
 //
 // Tugas:
-// 1. Cek subscription yang currentPeriodEnd <= now → charge ulang via Midtrans
+// 1. Cek subscription yang currentPeriodEnd <= now → charge ulang via Xendit
 // 2. Cek subscription PAST_DUE yang nextRetryAt <= now → retry charge
 // 3. Cek tenant TRIAL yang trialEndsAt <= now+1day → kirim trial_ending email
 // 4. Cek tenant TRIAL yang trialEndsAt <= now → suspend (kalau belum setup payment)
-//
-// Setup: pakai Vercel Cron (vercel.json) atau external cron-job.org
-//
-// Catatan: untuk recurring charge, kami coba dulu via Midtrans Subscription API
-// (bila midtransSubscriptionId ada). Jika tidak ada, fallback ke direct charge
-// pakai saved token.
 
 import { NextRequest, NextResponse } from "next/server";
 import prisma from "@/lib/db";
 import {
-  createCharge,
   directCharge,
-  getSubscription,
   SUBSCRIPTION_AMOUNT,
-} from "@/lib/midtrans";
+} from "@/lib/xendit";
 import {
   sendPaymentSuccessEmail,
   sendPaymentFailedEmail,
@@ -29,7 +21,7 @@ import {
 } from "@/lib/email";
 
 export async function GET(req: NextRequest) {
-  // Auth: pakai secret dari query param ATAU Authorization header (Vercel Cron style)
+  // Auth: pakai secret dari query param ATAU Authorization header
   const { searchParams } = new URL(req.url);
   const querySecret = searchParams.get("secret");
   const authHeader = req.headers.get("authorization") || "";
@@ -65,38 +57,24 @@ export async function GET(req: NextRequest) {
 
     for (const sub of dueSubs) {
       try {
-        const orderId = `REC-${sub.tenant.subdomain.toUpperCase()}-${Date.now()}`;
+        const referenceId = `REC-${sub.tenant.subdomain.toUpperCase()}-${Date.now()}`;
 
-        // Coba recurring via Midtrans Subscription API dulu
-        let chargeResult: unknown = null;
+        // Coba charge via Xendit pakai saved payment method
         let chargeSuccess = false;
-
-        if (sub.midtransSubscriptionId) {
-          // Midtrans auto-charge subscription - cek status
-          const subStatus = await getSubscription(sub.midtransSubscriptionId).catch(
-            () => null
-          );
-          // Midtrans subscription API akan auto-charge; kita cuma verify
-          // Untuk MVP: log dan rely on webhook
-          chargeResult = subStatus;
-        }
-
-        // Fallback: direct charge pakai saved token / charge baru
-        if (!chargeSuccess) {
-          try {
-            chargeResult = await directCharge({
-              orderId,
-              grossAmount: SUBSCRIPTION_AMOUNT,
-              customerName: sub.tenant.namaResto,
-              customerEmail: sub.tenant.email,
-              paymentType: "gopay", // default recurring
+        try {
+          if (sub.paymentMethodToken) {
+            await directCharge({
+              paymentMethodId: sub.paymentMethodToken,
+              amount: SUBSCRIPTION_AMOUNT,
+              description: `DapurSajiResto Monthly - ${sub.tenant.namaResto}`,
+              referenceId,
             });
             chargeSuccess = true;
-          } catch (e) {
-            results.errors.push(
-              `Charge failed tenant=${sub.tenantId}: ${(e as Error).message}`
-            );
           }
+        } catch (e) {
+          results.errors.push(
+            `Charge failed tenant=${sub.tenantId}: ${(e as Error).message}`
+          );
         }
 
         // Buat payment log pending (akan diupdate oleh webhook)
@@ -105,11 +83,29 @@ export async function GET(req: NextRequest) {
             tenantId: sub.tenantId,
             subscriptionId: sub.id,
             amount: SUBSCRIPTION_AMOUNT,
-            status: "PENDING",
-            gatewayRef: orderId,
+            status: chargeSuccess ? "PENDING" : "FAILED",
+            gatewayRef: referenceId,
             ewalletType: sub.ewalletType || undefined,
           },
         });
+
+        if (!chargeSuccess) {
+          // Kalau charge gagal, set ke PAST_DUE untuk retry
+          const nextRetry = new Date();
+          nextRetry.setDate(nextRetry.getDate() + 1);
+          await prisma.subscription.update({
+            where: { id: sub.id },
+            data: {
+              status: "PAST_DUE",
+              retryCount: 1,
+              nextRetryAt: nextRetry,
+            },
+          });
+          await prisma.tenant.update({
+            where: { id: sub.tenantId },
+            data: { status: "PAST_DUE" },
+          });
+        }
 
         results.renewed++;
       } catch (err) {
@@ -132,14 +128,16 @@ export async function GET(req: NextRequest) {
 
     for (const sub of retrySubs) {
       try {
-        const orderId = `RETRY-${sub.tenant.subdomain.toUpperCase()}-${Date.now()}`;
-        await directCharge({
-          orderId,
-          grossAmount: SUBSCRIPTION_AMOUNT,
-          customerName: sub.tenant.namaResto,
-          customerEmail: sub.tenant.email,
-          paymentType: "gopay",
-        });
+        const referenceId = `RETRY-${sub.tenant.subdomain.toUpperCase()}-${Date.now()}`;
+
+        if (sub.paymentMethodToken) {
+          await directCharge({
+            paymentMethodId: sub.paymentMethodToken,
+            amount: SUBSCRIPTION_AMOUNT,
+            description: `DapurSajiResto Retry - ${sub.tenant.namaResto}`,
+            referenceId,
+          });
+        }
 
         await prisma.paymentLog.create({
           data: {
@@ -147,7 +145,7 @@ export async function GET(req: NextRequest) {
             subscriptionId: sub.id,
             amount: SUBSCRIPTION_AMOUNT,
             status: "RETRYING",
-            gatewayRef: orderId,
+            gatewayRef: referenceId,
             ewalletType: sub.ewalletType || undefined,
           },
         });
@@ -206,7 +204,6 @@ export async function GET(req: NextRequest) {
     });
 
     for (const tenant of trialsEndingSoon) {
-      // Hanya kirim reminder kalau belum setup payment
       if (
         !tenant.subscription?.paymentMethodToken &&
         tenant.subscription?.status === "TRIALING"
@@ -233,7 +230,6 @@ export async function GET(req: NextRequest) {
     });
 
     for (const tenant of trialsExpired) {
-      // Jika belum setup payment → suspend
       if (!tenant.subscription?.paymentMethodToken) {
         await prisma.tenant.update({
           where: { id: tenant.id },

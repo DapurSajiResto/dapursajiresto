@@ -1,23 +1,29 @@
-// API: Setup subscription - user pilih e-wallet, create charge pertama
+// API: Setup subscription - user pilih e-wallet, buat payment via Xendit
 // POST /api/payment/subscribe
-// Body: { ewalletType: "gopay"|"ovo"|"shopeepay"|"qris"|"bank_transfer" }
+// Body: { ewalletType: "OVO"|"GOPAY"|"SHOPEEPAY"|"DANA"|"LINKAJA"|"QRIS"|"BCA" }
 //
 // Flow:
-// 1. Create Midtrans charge order (Rp 10.000) dengan payment type sesuai
-// 2. Return payment URL/deeplink untuk user bayar
-// 3. Setelah bayar (webhook), Midtrans kirim notif → handler setup recurring
-//
-// Catatan: Midtrans subscription API untuk GoPay bisa auto-recurring.
-// Untuk OVO/ShopeePay via QRIS/Gopay account, recurring perlu approval merchant.
+// 1. Create Xendit customer + payment method (e-wallet)
+// 2. Buat payment session / invoice untuk user authorize
+// 3. Return redirect URL untuk user bayar/authorize
+// 4. Setelah bayar (webhook), Xendit kirim notif → handler setup recurring
 
 import { NextRequest, NextResponse } from "next/server";
 import { requireAuth } from "@/lib/auth";
 import prisma from "@/lib/db";
-import { createCharge, SUBSCRIPTION_AMOUNT, SUPPORTED_EWALLETS } from "@/lib/midtrans";
+import {
+  createCustomer,
+  createPaymentMethod,
+  createPaymentSession,
+  createInvoice,
+  createRecurringPayment,
+  SUBSCRIPTION_AMOUNT,
+  SUPPORTED_EWALLETS,
+} from "@/lib/xendit";
 import { z } from "zod";
 
 const schema = z.object({
-  ewalletType: z.enum(["gopay", "ovo", "shopeepay", "qris", "bank_transfer"]),
+  ewalletType: z.enum(["OVO", "GOPAY", "SHOPEEPAY", "DANA", "LINKAJA", "QRIS", "BCA"]),
 });
 
 export async function POST(req: NextRequest) {
@@ -39,25 +45,111 @@ export async function POST(req: NextRequest) {
     const existing = await prisma.subscription.findUnique({
       where: { tenantId: user.tenantId },
     });
-    if (existing?.status === "ACTIVE" && existing.midtransSubscriptionId) {
+    if (existing?.status === "ACTIVE" && existing.paymentMethodToken) {
       return NextResponse.json(
         { error: "Langganan sudah aktif", subscription: existing },
         { status: 400 }
       );
     }
 
-    // Buat Midtrans order ID unik
-    const orderId = `SUB-${tenant!.subdomain.toUpperCase()}-${Date.now()}`;
+    const externalId = `SUB-${tenant!.subdomain.toUpperCase()}-${Date.now()}`;
 
-    // Create charge pertama (Rp 10.000) - sekaligus save payment method
-    const charge = await createCharge({
-      orderId,
-      grossAmount: SUBSCRIPTION_AMOUNT,
+    // Untuk BCA manual transfer: buat invoice saja
+    if (ewalletType === "BCA") {
+      const invoice = await createInvoice({
+        externalId,
+        amount: SUBSCRIPTION_AMOUNT,
+        description: "DapurSajiResto Subscription - Monthly (BCA Transfer)",
+        customerName: tenant!.namaResto,
+        customerEmail: tenant!.email,
+        customerPhone: tenant!.phone || undefined,
+        paymentMethods: ["BCA"],
+      });
+
+      await prisma.paymentLog.create({
+        data: {
+          tenantId: user.tenantId,
+          subscriptionId: existing!.id,
+          amount: SUBSCRIPTION_AMOUNT,
+          status: "PENDING",
+          gatewayRef: externalId,
+          ewalletType: "BCA" as never,
+        },
+      });
+
+      await prisma.subscription.update({
+        where: { tenantId: user.tenantId },
+        data: { ewalletType: "BCA" as never },
+      });
+
+      return NextResponse.json({
+        externalId,
+        paymentUrl: invoice.invoice_url,
+        method: "invoice",
+      });
+    }
+
+    // Untuk QRIS: buat invoice dengan QRIS
+    if (ewalletType === "QRIS") {
+      const invoice = await createInvoice({
+        externalId,
+        amount: SUBSCRIPTION_AMOUNT,
+        description: "DapurSajiResto Subscription - Monthly (QRIS)",
+        customerName: tenant!.namaResto,
+        customerEmail: tenant!.email,
+        customerPhone: tenant!.phone || undefined,
+        paymentMethods: ["QRIS"],
+      });
+
+      await prisma.paymentLog.create({
+        data: {
+          tenantId: user.tenantId,
+          subscriptionId: existing!.id,
+          amount: SUBSCRIPTION_AMOUNT,
+          status: "PENDING",
+          gatewayRef: externalId,
+          ewalletType: "QRIS" as never,
+        },
+      });
+
+      await prisma.subscription.update({
+        where: { tenantId: user.tenantId },
+        data: { ewalletType: "QRIS" as never },
+      });
+
+      return NextResponse.json({
+        externalId,
+        paymentUrl: invoice.invoice_url,
+        method: "invoice",
+      });
+    }
+
+    // Untuk e-wallet (OVO, GOPAY, SHOPEEPAY, DANA, LINKAJA):
+    // 1. Create customer di Xendit
+    const customer = await createCustomer({
+      referenceId: tenant!.id,
+      name: tenant!.namaResto,
+      email: tenant!.email,
+      phone: tenant!.phone || undefined,
+    });
+
+    // 2. Create payment method (reusable e-wallet)
+    const paymentMethod = await createPaymentMethod({
+      customerId: customer.id,
+      ewalletType: ewalletType as "OVO" | "GOPAY" | "SHOPEEPAY" | "DANA" | "LINKAJA",
       customerName: tenant!.namaResto,
       customerEmail: tenant!.email,
       customerPhone: tenant!.phone || undefined,
-      paymentType: ewalletType as "gopay" | "qris" | "shopeepay" | "ovo" | "bank_transfer",
-      savePaymentMethod: true,
+      successReturnUrl: `${process.env.NEXTAUTH_URL}/payment/success`,
+      failureReturnUrl: `${process.env.NEXTAUTH_URL}/payment/failed`,
+    });
+
+    // 3. Buat payment session untuk user authorize
+    const session = await createPaymentSession({
+      paymentMethodId: paymentMethod.id,
+      customerId: customer.id,
+      amount: SUBSCRIPTION_AMOUNT,
+      returnUrl: `${process.env.NEXTAUTH_URL}/payment/success`,
     });
 
     // Simpan payment log pending
@@ -67,27 +159,25 @@ export async function POST(req: NextRequest) {
         subscriptionId: existing!.id,
         amount: SUBSCRIPTION_AMOUNT,
         status: "PENDING",
-        gatewayRef: orderId,
-        ewalletType: ewalletType.toUpperCase() as never,
+        gatewayRef: externalId,
+        ewalletType: ewalletType as never,
       },
     });
 
-    // Update subscription ewallet type
+    // Update subscription dengan ewallet type dan xendit customer id
     await prisma.subscription.update({
       where: { tenantId: user.tenantId },
       data: {
-        ewalletType: ewalletType.toUpperCase() as never,
+        ewalletType: ewalletType as never,
+        midtransSubscriptionId: customer.id, // reuse field untuk Xendit customer ID
       },
     });
 
     return NextResponse.json({
-      orderId,
-      charge,
-      // Untuk GoPay/Qris: charge.actions punya deep-link/QR URL
-      paymentUrl:
-        (charge as { actions?: { name: string; url?: string }[] })?.actions?.find(
-          (a) => a.name === "deeplink-charge" || a.name === "generate-qr-code"
-        )?.url || null,
+      externalId,
+      paymentMethodId: paymentMethod.id,
+      paymentUrl: session.redirect_url,
+      method: "payment_session",
     });
   } catch (err) {
     console.error("[SUBSCRIBE] Error:", err);

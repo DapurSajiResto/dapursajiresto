@@ -1,67 +1,65 @@
-// Webhook Midtrans - handle notifikasi pembayaran
+// Webhook Xendit - handle notifikasi pembayaran
 // POST /api/payment/webhook
 //
-// Midtrans kirim notif saat:
+// Xendit kirim notif saat:
 // - payment pertama berhasil (subscription setup)
 // - recurring charge berhasil
 // - charge gagal
 //
-// Signature verification: SHA512(order_id + status_code + gross_amount + server_key)
+// Verification: cek x-callback-token header == XENDIT_WEBHOOK_TOKEN
 
 import { NextRequest, NextResponse } from "next/server";
 import prisma from "@/lib/db";
-import { verifyWebhookSignature } from "@/lib/midtrans";
+import { verifyWebhookToken } from "@/lib/xendit";
 import { sendPaymentSuccessEmail, sendPaymentFailedEmail, sendSuspendNoticeEmail } from "@/lib/email";
 
-interface MidtransNotification {
-  order_id: string;
-  status_code: string;
-  gross_amount: string;
-  signature_key: string;
-  transaction_status: string; // capture, settlement, pending, deny, expire, cancel
-  fraud_status?: string;
-  payment_type: string;
-  transaction_id?: string;
-  // Untuk recurring
-  subscription_id?: string;
-  saved_payment_method_id?: string;
+interface XenditWebhookEvent {
+  event: string; // payment.succeeded, payment.failed, invoice.paid, etc.
+  data: {
+    id: string;
+    external_id?: string;
+    payment_method_id?: string;
+    amount: number;
+    currency?: string;
+    status: string; // SUCCEEDED, PENDING, FAILED
+    payment_method?: {
+      type?: string;
+      ewallet?: { channel_code?: string };
+    };
+    created: string;
+    updated: string;
+  };
 }
 
 export async function POST(req: NextRequest) {
   try {
-    const body = (await req.json()) as MidtransNotification;
-
-    // 1. Verify signature
-    if (!verifyWebhookSignature(body)) {
-      console.error("[WEBHOOK] Invalid signature:", body.order_id);
-      return NextResponse.json({ error: "Invalid signature" }, { status: 401 });
+    // 1. Verify webhook token dari header
+    const callbackToken = req.headers.get("x-callback-token") || "";
+    if (!verifyWebhookToken(callbackToken)) {
+      console.error("[WEBHOOK] Invalid callback token");
+      return NextResponse.json({ error: "Invalid callback token" }, { status: 401 });
     }
 
-    // 2. Cari payment log berdasarkan gateway_ref (order_id)
+    const body = (await req.json()) as XenditWebhookEvent;
+    console.log(`[WEBHOOK] Event: ${body.event}, ref: ${body.data.external_id || body.data.id}`);
+
+    // 2. Cari payment log berdasarkan gateway_ref (external_id atau payment_request id)
+    const ref = body.data.external_id || body.data.id;
     const paymentLog = await prisma.paymentLog.findFirst({
-      where: { gatewayRef: body.order_id },
+      where: { gatewayRef: ref },
       include: { subscription: { include: { tenant: true } } },
     });
 
     if (!paymentLog) {
-      console.error("[WEBHOOK] Payment log not found:", body.order_id);
-      return NextResponse.json({ error: "Not found" }, { status: 404 });
+      console.error("[WEBHOOK] Payment log not found:", ref);
+      // Tetap return 200 supaya Xendit tidak retry
+      return NextResponse.json({ ok: true, note: "Payment log not found" });
     }
 
     const sub = paymentLog.subscription;
     const tenant = sub.tenant;
-    const isSubscriptionSetup = body.order_id.startsWith("SUB-");
-    const isRecurringCharge = body.order_id.startsWith("REC-") || !!body.subscription_id;
-
-    // 3. Handle berdasarkan transaction_status
-    const isSuccess =
-      body.transaction_status === "settlement" ||
-      (body.transaction_status === "capture" && body.fraud_status === "accept");
-
-    const isFailed =
-      body.transaction_status === "deny" ||
-      body.transaction_status === "cancel" ||
-      body.transaction_status === "expire";
+    const isSuccess = body.data.status === "SUCCEEDED" || body.event === "payment.succeeded" || body.event === "invoice.paid";
+    const isFailed = body.data.status === "FAILED" || body.event === "payment.failed";
 
     if (isSuccess) {
       // Update payment log
@@ -69,21 +67,20 @@ export async function POST(req: NextRequest) {
         where: { id: paymentLog.id },
         data: {
           status: "SUCCESS",
-          gatewayRef: body.transaction_id || paymentLog.gatewayRef,
+          gatewayRef: body.data.id || paymentLog.gatewayRef,
         },
       });
 
       // Update subscription: extend periode 1 bulan
-      const newPeriodEnd = new Date();
-      newPeriodEnd.setMonth(newPeriodEnd.getMonth() + 1);
-
-      // Jika subscription punya currentPeriodEnd lebih besar dari now, extend dari sana
       let baseDate = new Date();
       if (sub.currentPeriodEnd && sub.currentPeriodEnd > baseDate) {
         baseDate = new Date(sub.currentPeriodEnd);
       }
       const extendedEnd = new Date(baseDate);
       extendedEnd.setMonth(extendedEnd.getMonth() + 1);
+
+      // Simpan payment method ID untuk recurring
+      const pmId = body.data.payment_method_id;
 
       await prisma.subscription.update({
         where: { id: sub.id },
@@ -93,13 +90,7 @@ export async function POST(req: NextRequest) {
           currentPeriodEnd: extendedEnd,
           retryCount: 0,
           nextRetryAt: null,
-          // Simpan subscription_id dari Midtrans untuk recurring
-          ...(body.subscription_id
-            ? { midtransSubscriptionId: body.subscription_id }
-            : {}),
-          ...(body.saved_payment_method_id
-            ? { paymentMethodToken: body.saved_payment_method_id }
-            : {}),
+          ...(pmId ? { paymentMethodToken: pmId } : {}),
         },
       });
 
@@ -110,25 +101,26 @@ export async function POST(req: NextRequest) {
       });
 
       // Kirim email sukses
+      const ewalletChannel = body.data.payment_method?.ewallet?.channel_code || paymentLog.ewalletType?.toString() || "EWALLET";
       await sendPaymentSuccessEmail({
         tenantId: tenant.id,
         toEmail: tenant.email,
         namaResto: tenant.namaResto,
         amount: paymentLog.amount,
-        ewalletType: paymentLog.ewalletType?.toString() || body.payment_type,
+        ewalletType: ewalletChannel,
         periodeAkhir: extendedEnd,
         tanggalBayar: new Date(),
-        nomorRef: body.transaction_id || body.order_id,
+        nomorRef: body.data.id || ref,
       });
 
-      console.log(`[WEBHOOK] Success: ${body.order_id} tenant=${tenant.id}`);
+      console.log(`[WEBHOOK] Success: ${ref} tenant=${tenant.id}`);
     } else if (isFailed) {
       // Update payment log failed
       await prisma.paymentLog.update({
         where: { id: paymentLog.id },
         data: {
           status: "FAILED",
-          failureReason: `${body.transaction_status}${body.fraud_status ? ` (${body.fraud_status})` : ""}`,
+          failureReason: body.data.status,
         },
       });
 
@@ -172,21 +164,21 @@ export async function POST(req: NextRequest) {
           },
         });
 
-        // Update tenant status ke PAST_DUE (masih bisa akses)
         await prisma.tenant.update({
           where: { id: tenant.id },
           data: { status: "PAST_DUE" },
         });
 
+        const ewalletChannel = body.data.payment_method?.ewallet?.channel_code || paymentLog.ewalletType?.toString() || "EWALLET";
         await sendPaymentFailedEmail({
           tenantId: tenant.id,
           toEmail: tenant.email,
           namaResto: tenant.namaResto,
           amount: paymentLog.amount,
-          ewalletType: paymentLog.ewalletType?.toString() || body.payment_type,
+          ewalletType: ewalletChannel,
           retryCount: newRetryCount,
           nextRetryAt: nextRetry,
-          failureReason: body.transaction_status,
+          failureReason: body.data.status,
         });
       }
     }
